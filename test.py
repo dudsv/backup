@@ -1,130 +1,143 @@
+import asyncio
+import aiohttp
 import os
-import requests
-from xml.etree import ElementTree
+import tkinter as tk
+from tkinter import filedialog, messagebox
 from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.chrome.service import Service
-from tkinter import Tk, Label, Text, Button, Scrollbar, messagebox
-from tkinter.filedialog import askdirectory
+from selenium.webdriver.common.by import By
+from selenium.common.exceptions import NoSuchElementException
+from PIL import Image
+from lxml import etree
+import time
+from concurrent.futures import ThreadPoolExecutor
 
-# Função para capturar o screenshot
-def capture_screenshot(url, folder_name):
-    options = Options()
-    options.headless = True  # Executar em modo headless (sem abrir o navegador)
+# Função para fechar popups de cookies
+def close_cookie_popup(driver):
+    try:
+        cookie_selectors = [
+            "//button[contains(text(), 'Aceitar')]",
+            "//button[contains(text(), 'Accept')]",
+            "//button[contains(text(), 'OK')]",
+            "//div[contains(@class, 'cookie')]/button"
+        ]
+        for selector in cookie_selectors:
+            try:
+                cookie_button = driver.find_element(By.XPATH, selector)
+                cookie_button.click()
+                time.sleep(1)
+                break
+            except NoSuchElementException:
+                continue
+    except Exception:
+        pass
 
-    # Caminho para o ChromeDriver
-    chromedriver_path = r'C:\chromium\chromedriver.exe'
+# Função para capturar screenshots
+def capture_full_page_screenshot(url, folder_path, width):
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--hide-scrollbars")
+    driver = webdriver.Chrome(options=options)
 
-    # Usando Service para especificar o caminho do ChromeDriver
-    service = Service(chromedriver_path)
-    
-    # Inicia o driver com o caminho do ChromeDriver
-    driver = webdriver.Chrome(service=service, options=options)
-    driver.get(url)
+    try:
+        driver.get(url)
+        time.sleep(2)
+        close_cookie_popup(driver)
 
-    # Cria a pasta se não existir
-    if not os.path.exists(folder_name):
-        os.makedirs(folder_name)
+        driver.set_window_size(width, 1080)
+        time.sleep(2)
 
-    # Nome do arquivo para a captura da página completa
-    full_page_file_name = os.path.join(folder_name, "full_page.png")
-    # Nome do arquivo para a captura com largura de 1140px
-    width_1140_file_name = os.path.join(folder_name, "width_1140px.png")
+        total_width = driver.execute_script("return document.body.scrollWidth")
+        total_height = driver.execute_script("return document.body.scrollHeight")
+        driver.set_window_size(width, total_height)
+        time.sleep(2)
 
-    # Captura da página completa ajustando a janela para a altura total da página
-    total_height = driver.execute_script("return document.body.scrollHeight")
-    driver.set_window_size(1920, total_height)
-    driver.get_screenshot_as_file(full_page_file_name)
-    print(f"Screenshot da página completa salva em {full_page_file_name}")
+        temp_path = os.path.join(folder_path, "temp_screenshot.png")
+        driver.save_screenshot(temp_path)
 
-    # Captura com largura de 1140px
-    driver.set_window_size(1140, total_height)
-    driver.get_screenshot_as_file(width_1140_file_name)
-    print(f"Screenshot com largura de 1140px salva em {width_1140_file_name}")
+        output_path = os.path.join(folder_path, f"screenshot_{width}px.png")
+        with Image.open(temp_path) as img:
+            cropped_image = img.crop((0, 0, width, total_height))
+            cropped_image.save(output_path)
+        os.remove(temp_path)
 
-    driver.quit()
+    except Exception as e:
+        print(f"Erro ao capturar screenshot de {url}: {e}")
+    finally:
+        driver.quit()
 
-# Função para pegar URLs de um sitemap
-def get_urls_from_sitemap(sitemap_url):
-    response = requests.get(sitemap_url)
-    sitemap = ElementTree.fromstring(response.content)
-    urls = [url.find("loc").text for url in sitemap.findall(".//url")]
+# Função assíncrona para processar URLs
+async def process_urls(urls, output_dir):
+    async with aiohttp.ClientSession() as session:
+        tasks = []
+        with ThreadPoolExecutor() as executor:
+            for url in urls:
+                folder_name = url.replace("https://", "").replace("http://", "").replace("/", "_")
+                folder_path = os.path.join(output_dir, folder_name)
+                os.makedirs(folder_path, exist_ok=True)
+                tasks.append(
+                    asyncio.get_event_loop().run_in_executor(
+                        executor, capture_full_page_screenshot, url, folder_path, 1920
+                    )
+                )
+                tasks.append(
+                    asyncio.get_event_loop().run_in_executor(
+                        executor, capture_full_page_screenshot, url, folder_path, 1140
+                    )
+                )
+            await asyncio.gather(*tasks)
 
-    # Exibe as URLs recuperadas para verificação
-    print(f"URLs encontradas no sitemap: {urls}")
-    return urls
+# Função para extrair URLs de um sitemap
+async def extract_sitemap_urls(sitemap_url):
+    async with aiohttp.ClientSession() as session:
+        async with session.get(sitemap_url) as response:
+            xml_content = await response.text()
+            root = etree.fromstring(xml_content.encode("utf-8"))
+            return [loc.text for loc in root.findall(".//{http://www.sitemaps.org/schemas/sitemap/0.9}loc")]
 
-# Função para limpar caracteres inválidos no nome do diretório
-def clean_folder_name(url):
-    # Substitui os caracteres inválidos para Windows por um sublinhado (_)
-    invalid_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*']
-    for char in invalid_chars:
-        url = url.replace(char, "_")
-    return url
+# Interface gráfica com Tkinter
+def run_gui():
+    def start_process():
+        urls = entry_urls.get("1.0", "end").strip().split("\n")
+        sitemap_url = entry_sitemap.get().strip()
+        output_dir = filedialog.askdirectory(title="Selecione o Diretório de Saída")
 
-# Função principal para processar as URLs inseridas
-def process_urls():
-    # Obtém o texto da caixa de entrada
-    input_text = url_textbox.get("1.0", "end-1c")
-    
-    # Divide as URLs por linha
-    urls = input_text.split("\n")
-    
-    if not urls or all(url.strip() == "" for url in urls):
-        messagebox.showerror("Erro", "Por favor, insira pelo menos uma URL.")
-        return
-    
-    # Solicita ao usuário a seleção de uma pasta de saída
-    Tk().withdraw()  # Oculta a janela principal do Tkinter
-    base_folder = askdirectory(title="Selecione a pasta para salvar as capturas de tela")
+        if not output_dir:
+            messagebox.showerror("Erro", "Por favor, selecione um diretório de saída.")
+            return
 
-    # Verifica se o usuário selecionou uma pasta
-    if not base_folder:
-        print("Nenhuma pasta selecionada. O processo será encerrado.")
-        return
+        if sitemap_url:
+            asyncio.run(run_sitemap_process(sitemap_url, output_dir))
+        elif urls:
+            asyncio.run(run_url_process(urls, output_dir))
+        else:
+            messagebox.showerror("Erro", "Insira URLs ou forneça um sitemap.")
 
-    # Para cada URL, captura um screenshot
-    for url in urls:
-        url = url.strip()  # Remove espaços em branco no início e no final
-        if url:
-            print(f"Processando URL: {url}")
-            
-            # Verifica se a URL fornecida é um sitemap
-            urls_to_capture = []
-            if 'sitemap.xml' in url:
-                print('URL é um sitemap. Buscando URLs...')
-                urls_to_capture = get_urls_from_sitemap(url)
-            else:
-                print('URL não é um sitemap. Capturando screenshot da página...')
-                urls_to_capture.append(url)
-            
-            for url_to_capture in urls_to_capture:
-                # Limpa o nome da pasta usando a função clean_folder_name
-                folder_name = os.path.join(base_folder, clean_folder_name(url_to_capture))
-                capture_screenshot(url_to_capture, folder_name)
+    async def run_url_process(urls, output_dir):
+        await process_urls(urls, output_dir)
+        messagebox.showinfo("Sucesso", "Processo concluído!")
 
-    messagebox.showinfo("Sucesso", "Processo de captura concluído!")
+    async def run_sitemap_process(sitemap_url, output_dir):
+        urls = await extract_sitemap_urls(sitemap_url)
+        if urls:
+            await process_urls(urls, output_dir)
+            messagebox.showinfo("Sucesso", "Processo concluído!")
+        else:
+            messagebox.showerror("Erro", "Nenhuma URL encontrada no sitemap.")
 
-# Configuração da interface gráfica com Tkinter
-root = Tk()
-root.title("Captura de Screenshots de URLs")
+    root = tk.Tk()
+    root.title("Screenshot Automático")
 
-# Texto de instrução
-label = Label(root, text="Insira as URLs (uma por linha):")
-label.pack(pady=10)
+    tk.Label(root, text="Insira URLs (uma por linha):").pack()
+    entry_urls = tk.Text(root, height=10, width=50)
+    entry_urls.pack()
 
-# Caixa de texto para entrada de URLs
-url_textbox = Text(root, height=10, width=50)
-url_textbox.pack(pady=10)
+    tk.Label(root, text="Ou forneça a URL do Sitemap:").pack()
+    entry_sitemap = tk.Entry(root, width=50)
+    entry_sitemap.pack()
 
-# Adicionando barra de rolagem
-scrollbar = Scrollbar(root, command=url_textbox.yview)
-scrollbar.pack(side="right", fill="y")
-url_textbox.config(yscrollcommand=scrollbar.set)
+    tk.Button(root, text="Iniciar Processo", command=start_process).pack()
+    root.mainloop()
 
-# Botão para iniciar o processo
-process_button = Button(root, text="Iniciar Captura", command=process_urls)
-process_button.pack(pady=20)
-
-# Rodando a interface gráfica
-root.mainloop()
+if __name__ == "__main__":
+    run_gui()
